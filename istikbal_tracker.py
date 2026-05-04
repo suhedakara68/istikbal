@@ -3,6 +3,7 @@ import numpy as np
 from ultralytics import YOLO
 import json
 import os
+from PIL import Image, ImageDraw, ImageFont
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -16,15 +17,18 @@ CLS_MAKINE = 1
 CLS_PARCA = 2
 
 # Eşikler  
-MACHINE_IDLE_TIMEOUT = 3.0     # Makine durup bu kadar sn beklerse cycle biter
-MACHINE_MOTION_THRESHOLD = 1.0 # Piksel farkı bu değerin üstündeyse hareket var
-MACHINE_PERSIST_FRAMES = 150   # Makine kaybolsa bile bu kadar frame tracker korunur (5sn@30fps)
-MIN_CYCLE_DURATION = 2.0       # Bu süreden kısa cycle'lar sayılmaz
+MACHINE_IDLE_TIMEOUT = 3.0     # Makine durup bu kadar sn beklerse biter
+MACHINE_MOTION_THRESHOLD = 1.5 # Titreşimleri engellemek için eşik yükseltildi
+MACHINE_HOME_RATIO = 0.5       
+MACHINE_PERSIST_FRAMES = 150   
+MIN_CYCLE_DURATION = 1.0       
 MIN_CARRY_DURATION = 0.5       # Çok kısa taşıma süreleri filtrelenir
 BOX_INTERSECT_TOLERANCE = 50   # İşçi-parça çakışma toleransı (px)
 MIN_OVERLAP_THRESHOLD = 0.30   # Minimum overlap oranı (parça taşıyor sayılması için)
 CARRY_PERSIST_FRAMES = 60      # Parça kaybedilse bile 2sn boyunca taşıma devam eder
 CARRY_COOLDOWN_FRAMES = 90     # Bu süre içinde tekrar parça alırsa sayaç devam eder (sıfırlanmaz)
+PLAYBACK_SKIP = 2              # Her N frame'de bir işlem yap (Hızlandırmak için)
+PLAYBACK_DELAY = 1             # cv2.waitKey süresi (ms)
 
 # --- YARDIMCI FONKSİYONLAR ---
 def get_center(bbox):
@@ -50,6 +54,34 @@ def is_inside(point, roi):
     if roi is None or roi.size == 0:
         return False
     return cv2.pointPolygonTest(roi, (float(point[0]), float(point[1])), False) >= 0
+
+# --- MODERN UI ENGINE (PIL tabanlı) ---
+def get_font(size=20, bold=False):
+    try:
+        # Windows UI fontu (iOS/iPhone stiline en yakın temiz font)
+        font_path = "C:/Windows/Fonts/seguisb.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf"
+        return ImageFont.truetype(font_path, size)
+    except:
+        return ImageFont.load_default()
+
+def draw_styled_text(img, text, pos, size=20, color=(255, 255, 255), bold=False):
+    # OpenCV (BGR) -> PIL (RGB)
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    font = get_font(size, bold)
+    draw.text(pos, text, font=font, fill=color)
+    # PIL -> OpenCV (BGR)
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+def draw_glass_panel(img, x1, y1, x2, y2, color=(30, 30, 40), alpha=0.8):
+    sub = img[y1:y2, x1:x2]
+    rect = np.zeros(sub.shape, dtype=np.uint8)
+    rect[:] = color
+    res = cv2.addWeighted(sub, 1-alpha, rect, alpha, 0)
+    img[y1:y2, x1:x2] = res
+    # İnce parlak kenar (Glow effect)
+    cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), 1, cv2.LINE_AA)
+    return img
 
 # --- ROI YÜKLEME ---
 def load_rois():
@@ -80,10 +112,10 @@ def main():
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps == 0: fps = 30.0
-    print(f"Video açıldı: {VIDEO_PATH} | FPS: {fps:.1f}")
-
     frame_count = 0
-
+    skip_counter = PLAYBACK_SKIP
+    is_paused = False
+    
     # ── İŞÇİ TAKİP ──
     # Her işçi: {state: "BOS"/"TASIYOR", start_frame, carried_part_id, last_bbox}
     worker_tracker = {}
@@ -95,13 +127,23 @@ def main():
     machine_tracker = {}
     machine_log = []
 
-    cv2.namedWindow("Istikbal Tracker", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Istikbal Modern Analytics", cv2.WINDOW_NORMAL)
 
     while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_count += 1
+        if not is_paused:
+            ret, frame = cap.read()
+            if not ret: break
+            frame_count += 1
+            
+            # Performans için frame atla (Hızlandırma)
+            if frame_count % skip_counter != 0:
+                continue
+        else:
+            # Duraklatılmışsa sadece klavyeyi dinle
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord('p'): is_paused = False
+            elif key == ord('q'): break
+            continue
 
         # YOLO takip
         results = model.track(frame, persist=True, verbose=False)
@@ -248,7 +290,7 @@ def main():
                 best_key = m_id
             else:
                 # ID eşleşmedi → konuma göre en yakın tracker'ı bul
-                best_dist = 200  # Max 200px uzaklık
+                best_dist = 400  # Mesafe toleransı artırıldı (Flicker için)
                 for tk, tv in machine_tracker.items():
                     if tk in matched_tracker_keys:
                         continue
@@ -272,6 +314,9 @@ def main():
                     "last_pos": m_center,
                     "current_dur": 0.0,
                     "prev_crop": None,
+                    "home_crop": None,              # Cycle başındaki referans görüntü
+                    "has_moved_away": False,        # Makine evden uzaklaştı mı?
+                    "max_h_diff": 0.0,              # Cycle içindeki max fark
                     "last_seen_frame": frame_count,
                     "last_bbox": m_bbox,
                 }
@@ -282,10 +327,10 @@ def main():
             mt["last_bbox"] = m_bbox
             matched_tracker_keys.add(m_id)
             
-            # --- Makine bbox'ının üst yarısını crop et (boru bölgesi) ---
+            # --- Makine bbox'ının üst kısmını crop et (boru bölgesi) ---
             x1, y1, x2, y2 = int(m_bbox[0]), int(m_bbox[1]), int(m_bbox[2]), int(m_bbox[3])
             h = y2 - y1
-            pipe_y2 = y1 + int(h * 0.5)
+            pipe_y2 = y1 + int(h * 0.3) # Sadece üst %30 (Borunun olduğu yer)
             x1, y1 = max(0, x1), max(0, y1)
             x2 = min(frame.shape[1], x2)
             pipe_y2 = min(frame.shape[0], max(pipe_y2, y1 + 1))
@@ -293,27 +338,52 @@ def main():
             crop = frame[y1:pipe_y2, x1:x2]
             crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.size > 0 else None
             
-            # --- Frame-to-frame piksel farkı ---
+            # --- Frame-to-frame piksel farkı (Anlık Hareket) ---
             pixel_diff = 0.0
             if mt["prev_crop"] is not None and crop_gray is not None:
                 try:
                     if mt["prev_crop"].shape == crop_gray.shape:
                         diff = cv2.absdiff(crop_gray, mt["prev_crop"])
+                        pixel_diff = np.mean(diff)
                     else:
                         prev_resized = cv2.resize(mt["prev_crop"], (crop_gray.shape[1], crop_gray.shape[0]))
                         diff = cv2.absdiff(crop_gray, prev_resized)
-                    pixel_diff = np.mean(diff)
+                        pixel_diff = np.mean(diff)
                 except:
                     pixel_diff = 0.0
-            
-            mt["prev_crop"] = crop_gray
-            
-            # Hareket var mı? (basit threshold)
             is_moving = pixel_diff > MACHINE_MOTION_THRESHOLD
             
+            # --- Referans (Home) görüntüsüne olan fark ---
+            home_diff = 100.0 # Varsayılan yüksek fark
+            if mt["home_crop"] is not None and crop_gray is not None:
+                try:
+                    if mt["home_crop"].shape == crop_gray.shape:
+                        h_diff = cv2.absdiff(crop_gray, mt["home_crop"])
+                        home_diff = np.mean(h_diff)
+                    else:
+                        home_resized = cv2.resize(mt["home_crop"], (crop_gray.shape[1], crop_gray.shape[0]))
+                        h_diff = cv2.absdiff(crop_gray, home_resized)
+                        home_diff = np.mean(h_diff)
+                except:
+                    home_diff = 100.0
+
+            mt["prev_crop"] = crop_gray
+            
+            # Hareket yoksa Home görüntüsünü güncelle (En güncel durma hali)
+            if not is_moving and crop_gray is not None:
+                mt["home_crop"] = crop_gray
+            
+            # Makine evden uzaklaştı mı?
+            if mt["state"] == "WORKING":
+                if home_diff > mt["max_h_diff"]:
+                    mt["max_h_diff"] = home_diff
+                
+                if home_diff > 5.0: # En az 5 piksel fark oluşmalı
+                    mt["has_moved_away"] = True
+
             # Debug
             if frame_count % 60 == 0:
-                print(f"  [M-DEBUG] Makine {m_id}: state={mt['state']}, pixel_diff={pixel_diff:.2f}, moving={is_moving}, dur={mt['current_dur']:.1f}s")
+                print(f"  [M-DEBUG] Makine {m_id}: state={mt['state']}, p_diff={pixel_diff:.1f}, h_diff={home_diff:.1f}, max_h={mt['max_h_diff']:.1f}, away={mt['has_moved_away']}")
             
             # --- STATE MACHINE ---
             if mt["state"] == "IDLE":
@@ -321,31 +391,40 @@ def main():
                     mt["state"] = "WORKING"
                     mt["start_frame"] = frame_count
                     mt["idle_start_frame"] = None
-                    print(f"[MAKİNE {m_id}] Cycle başladı! (frame {frame_count})")
+                    mt["has_moved_away"] = False
+                    mt["max_h_diff"] = 0.0
+                    print(f"[MAKİNE {m_id}] Cycle başladı!")
             
             elif mt["state"] == "WORKING":
-                if is_moving:
-                    # Hareket var → idle timer sıfırla, cycle devam
-                    mt["idle_start_frame"] = None
-                else:
-                    # Hareket yok → idle timer başlat
+                cycle_ended = False
+                
+                # Sadece Durma timeout (Süre başa sarmasın diye 'eve döndü' kontrolünü kaldırdık)
+                if not is_moving:
                     if mt["idle_start_frame"] is None:
                         mt["idle_start_frame"] = frame_count
                     else:
                         idle_duration = (frame_count - mt["idle_start_frame"]) / fps
                         if idle_duration >= MACHINE_IDLE_TIMEOUT:
-                            # Cycle bitti!
-                            cycle_time = (mt["idle_start_frame"] - mt["start_frame"]) / fps
-                            if cycle_time >= MIN_CYCLE_DURATION:
-                                machine_log.append({
-                                    "machine_id": m_id,
-                                    "cycle_time": cycle_time,
-                                    "frame": frame_count
-                                })
-                                print(f"[MAKİNE {m_id}] Cycle bitti! Süre: {cycle_time:.2f}s (frame {frame_count})")
-                            mt["state"] = "IDLE"
-                            mt["start_frame"] = None
-                            mt["idle_start_frame"] = None
+                            duration = (mt["idle_start_frame"] - mt["start_frame"]) / fps
+                            if duration >= MIN_CYCLE_DURATION:
+                                cycle_ended = True
+                                print(f"[MAKİNE {m_id}] İşlem tamamlandı (durdu), süre: {duration:.2f}s")
+                else:
+                    mt["idle_start_frame"] = None
+
+                if cycle_ended:
+                    duration = (frame_count - mt["start_frame"]) / fps
+                    machine_log.append({
+                        "machine_id": m_id,
+                        "cycle_time": duration,
+                        "frame": frame_count
+                    })
+                    print(f"[MAKİNE {m_id}] Cycle kaydedildi: {duration:.2f}s")
+                    mt["state"] = "IDLE"
+                    mt["start_frame"] = None
+                    mt["idle_start_frame"] = None
+                    mt["has_moved_away"] = False
+                    mt["max_h_diff"] = 0.0
             
             # Anlık süre
             if mt["state"] == "WORKING" and mt["start_frame"] is not None:
@@ -353,44 +432,47 @@ def main():
             else:
                 mt["current_dur"] = 0.0
             
-            # --- VİZÜALİZASYON ---
+            # --- VİZÜALİZASYON (Makine) ---
             if mt["state"] == "WORKING":
-                if is_moving:
-                    m_color = (0, 255, 0)   # Yeşil
-                    m_label = f"Makine {m_id}: CALISIYOR ({mt['current_dur']:.1f}s)"
-                else:
-                    m_color = (0, 200, 255)  # Turuncu - kısa duraklama
-                    m_label = f"Makine {m_id}: CALISIYOR ({mt['current_dur']:.1f}s)"
+                m_color = (0, 255, 100) if is_moving else (0, 180, 255)
+                m_label = f"M{m_id} ACTIVE"
             else:
-                m_color = (150, 150, 150)
-                m_label = f"Makine {m_id}: IDLE"
+                m_color = (180, 180, 180)
+                m_label = f"M{m_id} IDLE"
             
-            cv2.rectangle(frame, (int(m_bbox[0]), int(m_bbox[1])),
-                          (int(m_bbox[2]), int(m_bbox[3])), m_color, 2)
-            cv2.putText(frame, m_label, (int(m_bbox[0]), int(m_bbox[1])-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, m_color, 2)
-            
-            # Boru bölgesi + hareket barı
-            cv2.rectangle(frame, (x1, y1), (x2, pipe_y2), (255, 255, 0), 1)
-            bar_x = int(m_bbox[0])
-            bar_y = int(m_bbox[3]) + 5
-            bar_len = min(int(pixel_diff * 10), 200)
-            bar_color = (0, 255, 0) if is_moving else (0, 0, 255)
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_len, bar_y + 8), bar_color, -1)
-            cv2.putText(frame, f"diff:{pixel_diff:.1f}", (bar_x, bar_y + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            # Zarif Köşeli Box
+            x1, y1, x2, y2 = int(m_bbox[0]), int(m_bbox[1]), int(m_bbox[2]), int(m_bbox[3])
+            cv2.rectangle(frame, (x1, y1), (x2, y2), m_color, 1, cv2.LINE_AA)
+            frame = draw_styled_text(frame, m_label, (x1, y1-25), 16, m_color[::-1], True)
+
+            # Modern Status Barları
+            bar_x, bar_y = x1, y2 + 8
+            # P_DIFF (Hız)
+            p_w = min(int(pixel_diff * 10), 100)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + 100, bar_y + 4), (50, 50, 50), -1)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + p_w, bar_y + 4), (255, 150, 0), -1)
+            # H_DIFF (Tur İlerlemesi)
+            h_w = min(int(home_diff * 2), 100)
+            cv2.rectangle(frame, (bar_x, bar_y + 8), (bar_x + 100, bar_y + 12), (50, 50, 50), -1)
+            cv2.rectangle(frame, (bar_x, bar_y + 8), (bar_x + h_w, bar_y + 12), (0, 255, 255), -1)
         
-        # Kaybolmuş makineleri temizle (persistence ile - hemen silme!)
+        # Kaybolmuş makineleri temizle
         lost_machines = [mid for mid in machine_tracker if mid not in matched_tracker_keys]
         for mid in list(lost_machines):
-            age = frame_count - machine_tracker[mid]["last_seen_frame"]
+            mt = machine_tracker[mid]
+            age = frame_count - mt["last_seen_frame"]
+            
+            if mt["state"] == "WORKING" and mt["start_frame"] is not None:
+                mt["current_dur"] = (frame_count - mt["start_frame"]) / fps
+                m_bbox = mt["last_bbox"]
+                cv2.rectangle(frame, (int(m_bbox[0]), int(m_bbox[1])), (int(m_bbox[2]), int(m_bbox[3])), (100, 100, 100), 1, cv2.LINE_8)
+                frame = draw_styled_text(frame, f"M{mid} TRACING", (int(m_bbox[0]), int(m_bbox[1])-20), 14, (150, 150, 150), False)
+
             if age > MACHINE_PERSIST_FRAMES:
-                # Çok uzun süredir kayıp → sil
-                if machine_tracker[mid]["state"] == "WORKING" and machine_tracker[mid]["start_frame"] is not None:
-                    cycle_time = (frame_count - machine_tracker[mid]["start_frame"]) / fps
+                if mt["state"] == "WORKING" and mt["start_frame"] is not None:
+                    cycle_time = (frame_count - mt["start_frame"]) / fps
                     if cycle_time >= MIN_CYCLE_DURATION:
                         machine_log.append({"machine_id": mid, "cycle_time": cycle_time, "frame": frame_count})
-                        print(f"[MAKİNE {mid}] Kayboldu (cycle süresi: {cycle_time:.2f}s)")
                 del machine_tracker[mid]
             # else: tracker korunuyor, makine geri gelecek
 
@@ -417,64 +499,59 @@ def main():
             cv2.putText(frame, "MAKINE HOME", (machine_roi[0][0], machine_roi[0][1]-10), 1, 1.5, (0, 255, 0), 2)
 
         # ═══════════════════════════════════════
-        # DASHBOARD (SOL ÜST KÖŞE)
+        # MODERN PREMIUM DASHBOARD
         # ═══════════════════════════════════════
-        overlay = frame.copy()
-        panel_h = 60 + len(worker_log[-3:]) * 30 + len(machine_log[-3:]) * 30 + 120
-        cv2.rectangle(overlay, (10, 10), (500, panel_h), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        frame = draw_glass_panel(frame, 20, 20, 420, 500, (40, 30, 20), 0.75)
+        
+        # Başlık
+        frame = draw_styled_text(frame, "İSTİKBAL", (40, 40), 28, (255, 255, 255), True)
+        frame = draw_styled_text(frame, "INDUSTRIAL ANALYTICS", (40, 75), 14, (200, 200, 200), False)
+        cv2.line(frame, (40, 100), (390, 100), (255, 255, 255), 1, cv2.LINE_AA)
 
-        y = 35
-        cv2.putText(frame, "=== ISCI SAYACI ===", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        y += 30
-
-        # Aktif işçiler
-        for wid, wt in worker_tracker.items():
-            if wt["state"] == "TASIYOR":
-                elapsed = (frame_count - wt["start_frame"]) / fps
-                cv2.putText(frame, f"  Isci {wid}: TASIYOR {elapsed:.1f}s", (20, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            else:
-                cv2.putText(frame, f"  Isci {wid}: BOS", (20, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-            y += 25
-
-        # Son tamamlanan taşımalar
-        if worker_log:
-            last_w = worker_log[-1]
-            cv2.putText(frame, f"  Son Tasima: Isci {last_w['worker_id']} = {last_w['duration']:.2f}s", (20, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 2)
-            y += 25
-        cv2.putText(frame, f"  Toplam Tasima: {len(worker_log)}", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        y = 120
+        # --- İŞÇİ PANELİ ---
+        frame = draw_styled_text(frame, "HUMAN ACTIVITY", (40, y), 18, (0, 200, 255), True)
         y += 35
-
-        cv2.putText(frame, "=== MAKINE SAYACI ===", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        y += 30
-
-        # Aktif makineler
+        for wid, wt in worker_tracker.items():
+            color = (0, 255, 100) if wt["state"] == "TASIYOR" else (200, 200, 200)
+            status = f"WORKING {((frame_count - wt['start_frame'])/fps):.1f}s" if wt["state"] == "TASIYOR" else "IDLE"
+            frame = draw_styled_text(frame, f"Worker {wid}: {status}", (50, y), 15, color[::-1], False)
+            y += 25
+        
+        y += 20
+        # --- MAKİNE PANELİ ---
+        frame = draw_styled_text(frame, "MACHINE CYCLES", (40, y), 18, (100, 255, 0), True)
+        y += 35
         for mid, mt in machine_tracker.items():
-            if mt["state"] != "IDLE":
-                cv2.putText(frame, f"  Makine {mid}: {mt['state']} {mt['current_dur']:.1f}s", (20, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            else:
-                cv2.putText(frame, f"  Makine {mid}: IDLE", (20, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
+            color = (0, 255, 100) if mt["state"] == "WORKING" else (180, 180, 180)
+            status = f"RUNNING {mt['current_dur']:.1f}s" if mt["state"] == "WORKING" else "IDLE"
+            frame = draw_styled_text(frame, f"Machine {mid}: {status}", (50, y), 15, color[::-1], False)
             y += 25
 
-        # Son cycle
-        if machine_log:
-            last_m = machine_log[-1]
-            cv2.putText(frame, f"  Son Cycle: Makine {last_m['machine_id']} = {last_m['cycle_time']:.2f}s", (20, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 2)
-            y += 25
-        cv2.putText(frame, f"  Toplam Cycle: {len(machine_log)}", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        y += 30
+        # --- ÖZET İSTATİSTİKLER ---
+        cv2.rectangle(frame, (40, y), (390, y+80), (60, 50, 40), -1)
+        frame = draw_styled_text(frame, f"Total Cycles: {len(machine_log)}", (60, y+15), 16, (255, 255, 255), True)
+        frame = draw_styled_text(frame, f"Total Carries: {len(worker_log)}", (60, y+45), 16, (255, 255, 255), True)
+
+        # Alt Bilgi
+        frame = draw_styled_text(frame, f"FPS: {fps:.1f} | Frame: {frame_count}", (40, 470), 12, (150, 150, 150), False)
 
         # Göster
-        cv2.imshow("Istikbal Tracker", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.imshow("Istikbal Modern Analytics", frame)
+        
+        # --- KLAVYE KONTROLLERİ ---
+        key = cv2.waitKey(PLAYBACK_DELAY) & 0xFF
+        if key == ord('q'): 
             break
+        elif key == ord('p'): 
+            is_paused = not is_paused
+        elif key == ord('f'): # Daha Hızlı
+            skip_counter = min(skip_counter + 1, 10)
+            print(f"[HIZ] Frame Skip: {skip_counter}")
+        elif key == ord('s'): # Daha Yavaş
+            skip_counter = max(skip_counter - 1, 1)
+            print(f"[HIZ] Frame Skip: {skip_counter}")
 
     cap.release()
     cv2.destroyAllWindows()
